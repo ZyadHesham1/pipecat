@@ -55,9 +55,10 @@ SYSTEM_PROMPT = (
     "3. Triage the urgency (emergency leak, no cooling, routine maintenance, etc.).\n"
     "4. Collect the caller's name and confirm their phone number.\n"
     "5. Ask for their preferred appointment date and time.\n"
-    "6. Use the 'check_and_book_slot' tool to attempt the booking.\n"
-    "7. If the tool returns SUCCESS, confirm the details with the caller.\n"
-    "8. If the tool returns an ERROR, explain the issue and offer alternatives.\n\n"
+    "6. Use the 'check_availability' tool first to verify the technician is free at the requested slot.\n"
+    "7. If available, use the 'check_and_book_slot' tool to book the appointment.\n"
+    "8. If the tool returns SUCCESS, confirm the details with the caller.\n"
+    "9. If a tool returns an ERROR, explain the issue and offer alternatives.\n\n"
     "RULES:\n"
     "- Be highly concise. Your responses will be spoken aloud.\n"
     "- Never use emojis, bullet points, or markdown formatting.\n"
@@ -67,6 +68,8 @@ SYSTEM_PROMPT = (
     "- If the caller provides an invalid time, politely ask them to choose another.\n"
     "- If a slot is taken, apologize and suggest the next available hour.\n"
     "- Speak in the same language the caller uses (Arabic or English).\n"
+    "- Valid technician IDs are: TECH_01, TECH_02, TECH_03, TECH_04, TECH_05.\n"
+    "  Use the most relevant one. Do NOT make up technician IDs.\n"
 )
 
 
@@ -147,7 +150,7 @@ async def build_and_run_pipeline(
         f"Registered MCP tools: {[t.name for t in mcp_tools.standard_tools]}"
     )
 
-    # Wrap each registered handler with timeout + error catching
+    # Wrap each registered handler with timeout + error catching and detailed logging
     import asyncio
 
     from pipecat.frames.frames import TTSSpeakFrame
@@ -157,18 +160,34 @@ async def build_and_run_pipeline(
             async def speak_delay():
                 try:
                     await asyncio.sleep(5.0)
-                    logger.info("Tool execution taking longer than 5s, playing loading message")
+                    logger.info(f"Tool '{params.function_name}' execution taking longer than 5s, playing loading message")
                     await params.llm.push_frame(TTSSpeakFrame("Bear with me, it's loading."))
                 except asyncio.CancelledError:
                     pass
 
             delay_task = asyncio.create_task(speak_delay())
+
+            # Intercept and log the tool results/failures via the result callback
+            original_callback = params.result_callback
+
+            async def wrapped_callback(result):
+                logger.info(f"MCP Tool '{params.function_name}' result callback invoked. Result: {result}")
+                await original_callback(result)
+
+            params.result_callback = wrapped_callback
+
+            logger.info(
+                f"LLM invoking MCP Tool '{params.function_name}' (call ID: {params.tool_call_id}) "
+                f"with arguments: {params.arguments}"
+            )
+
             try:
                 result = await original_handler(params)
                 return result
             except Exception as e:
-                logger.error(f"Error executing tool: {e}")
-                return "ERROR: hmm.. it seems like I can't access the calendar right now, can I give you a call in a few minutes to check?"
+                logger.error(f"Error executing tool wrapper for '{params.function_name}': {e}")
+                err_msg = "ERROR: hmm.. it seems like I can't access the calendar right now, can I give you a call in a few minutes to check?"
+                await original_callback(err_msg)
             finally:
                 delay_task.cancel()
                 try:
@@ -182,7 +201,7 @@ async def build_and_run_pipeline(
         if registry_item.handler is not None:
             original = registry_item.handler
             registry_item.handler = make_tool_wrapper(original)
-            logger.info(f"Wrapped tool '{tool_name}' with timeout/error handler")
+            logger.info(f"Wrapped tool '{tool_name}' with timeout/error handler and logging")
 
     # -----------------------------------------------------------------------
     # 4. Text-to-Speech (Cartesia Sonic)

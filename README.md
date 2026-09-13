@@ -71,10 +71,61 @@ redis-cli ping       # Should print PONG
 
 ### Frappe CRM Setup
 
-The MCP server proxies bookings to a Frappe CRM instance. You need:
+The MCP server proxies bookings to a Frappe CRM instance. You can either use **Frappe Cloud** (managed hosting) or run CRM **locally via Docker** for testing.
 
-1. A running Frappe Cloud site (or self-hosted ERPNext/Frappe instance)
-2. A custom DocType called **`TechnicianSchedule`** with these fields:
+#### Option A: Local Docker Setup (Recommended for Testing)
+
+**Prerequisites:** Docker and Docker Compose installed ([docs.docker.com](https://docs.docker.com/)).
+
+**Step 1:** Start the containers from the included `frappe-crm/` directory:
+
+```bash
+cd frappe-crm
+docker compose up -d
+```
+
+This pulls and starts three containers:
+- **MariaDB 10.8** — database
+- **Redis** — caching/queue
+- **Frappe Bench** — runs the `init.sh` script which automatically initializes bench (Frappe v15), clones and installs the CRM app, creates a site, and starts the dev server
+
+> **⏱️ First run takes ~15–20 minutes** (downloading ~1GB Docker image + installing Python/JS dependencies). Subsequent restarts are instant thanks to the `bench-data` persistent volume.
+
+**Step 2:** Add the hostname to `/etc/hosts`:
+
+```bash
+sudo sh -c 'echo "127.0.0.1 crm.localhost" >> /etc/hosts'
+```
+
+**Step 3:** Access CRM at [http://crm.localhost:8000/crm](http://crm.localhost:8000/crm):
+
+| | |
+|---|---|
+| **URL** | `http://crm.localhost:8000/crm` |
+| **Username** | `Administrator` |
+| **Password** | `admin` |
+
+> **🔒 Change the default password** after your first login.
+
+**Docker Management:**
+
+| Action | Command |
+|--------|---------|
+| Stop containers | `docker compose -f frappe-crm/docker-compose.yml stop` |
+| Start containers | `docker compose -f frappe-crm/docker-compose.yml start` |
+| View logs | `docker compose -f frappe-crm/docker-compose.yml logs frappe -f` |
+| Tear down (keeps data) | `docker compose -f frappe-crm/docker-compose.yml down` |
+| Tear down + delete data | `docker compose -f frappe-crm/docker-compose.yml down -v` |
+
+#### Option B: Frappe Cloud (Managed Hosting)
+
+Sign up at [frappecloud.com/crm/signup](https://frappecloud.com/crm/signup) for a fully managed instance.
+
+#### CRM Configuration (Both Options)
+
+Once your CRM instance is running, you need:
+
+1. A custom DocType called **`TechnicianSchedule`** with these fields:
 
    | Field | Type |
    |-------|------|
@@ -87,7 +138,16 @@ The MCP server proxies bookings to a Frappe CRM instance. You need:
    | `issue_description` | Small Text |
    | `status` | Data |
 
-3. An API key + secret pair generated from **Settings → API Access** in your Frappe site
+2. An API key + secret pair generated from **Settings → API Access** in your Frappe site
+3. Update `server/.env` with your CRM connection details:
+   ```env
+   # For local Docker setup:
+   FRAPPE_CRM_URL=http://crm.localhost:8000
+   # For Frappe Cloud:
+   # FRAPPE_CRM_URL=https://your-site.frappe.cloud
+   FRAPPE_CRM_API_KEY=your_frappe_api_key
+   FRAPPE_CRM_API_SECRET=your_frappe_api_secret
+   ```
 
 ## Getting Started
 
@@ -233,6 +293,9 @@ pipecat-quickstart/
 │   ├── Dockerfile             # Container image for Pipecat Cloud
 │   ├── pcc-deploy.toml        # Pipecat Cloud deployment config
 │   └── ngrok                  # ngrok binary for tunneling
+├── frappe-crm/
+│   ├── docker-compose.yml     # Docker Compose for local Frappe CRM
+│   └── init.sh                # Bench init + CRM install automation script
 ├── Pipecat HVAC AI Agent Guide.md  # Detailed architecture reference
 ├── .gitignore
 └── README.md

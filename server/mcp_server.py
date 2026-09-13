@@ -22,6 +22,7 @@ Run independently:
 """
 
 import datetime
+import json
 import os
 import uuid
 
@@ -55,6 +56,12 @@ FRAPPE_CRM_URL = os.getenv("FRAPPE_CRM_URL", "https://zyad-crm.k.frappe.cloud")
 FRAPPE_CRM_API_KEY = os.getenv("FRAPPE_CRM_API_KEY", "")
 FRAPPE_CRM_API_SECRET = os.getenv("FRAPPE_CRM_API_SECRET", "")
 
+# Startup diagnostics — confirm env vars are loaded
+logger.info(f"FRAPPE_CRM_URL = {FRAPPE_CRM_URL}")
+logger.info(f"FRAPPE_CRM_API_KEY = {FRAPPE_CRM_API_KEY[:4]}****" if FRAPPE_CRM_API_KEY else "FRAPPE_CRM_API_KEY = (empty!)")
+logger.info(f"FRAPPE_CRM_API_SECRET = {FRAPPE_CRM_API_SECRET[:4]}****" if FRAPPE_CRM_API_SECRET else "FRAPPE_CRM_API_SECRET = (empty!)")
+logger.info(f"REDIS_URL = {REDIS_URL}")
+
 
 # ---------------------------------------------------------------------------
 # Pydantic Validation Schema
@@ -70,7 +77,7 @@ class SlotBookingRequest(BaseModel):
     technician_id: str = Field(
         ...,
         min_length=1,
-        description="The ID of the technician (e.g., 'TECH_01').",
+        description="The technician's ID. Valid values: TECH_01, TECH_02, TECH_03, TECH_04, TECH_05. Do NOT use the service type as the technician ID.",
     )
     customer_name: str = Field(
         ...,
@@ -95,7 +102,7 @@ class SlotBookingRequest(BaseModel):
         description=(
             "Type of HVAC service. Must be one of: "
             "'emergency_repair', 'maintenance', 'installation', "
-            "'inspection', 'duct_cleaning'."
+            "'inspection', 'duct_cleaning'. Do NOT use this as the technician_id."
         ),
     )
     issue_description: str = Field(
@@ -158,14 +165,94 @@ class SlotBookingRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# MCP Tool: check_availability
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="check_availability",
+    description=(
+        "FIRST STEP — Call this BEFORE check_and_book_slot. Checks if a "
+        "specific technician is free at the proposed date and time by querying "
+        "the Frappe CRM. Returns AVAILABLE or UNAVAILABLE."
+    ),
+)
+async def check_availability(
+    technician_id: str,
+    proposed_date: str,
+    proposed_time: str,
+    ctx: Context = None,
+) -> str:
+    """Queries Frappe CRM to check for existing TechnicianSchedule records."""
+    logger.info(
+        f"check_availability called: technician_id={technician_id}, "
+        f"proposed_date={proposed_date}, proposed_time={proposed_time}"
+    )
+    # Validate parsing before query
+    try:
+        dt_date = datetime.date.fromisoformat(proposed_date)
+        dt_time = datetime.time.fromisoformat(proposed_time)
+    except ValueError as e:
+        logger.warning(
+            f"Parsing failed in check_availability: proposed_date={proposed_date}, "
+            f"proposed_time={proposed_time}. Error: {e}"
+        )
+        return "ERROR: Invalid format. Use YYYY-MM-DD for date and HH:MM for time."
+
+    date_str = dt_date.strftime("%Y-%m-%d")
+    time_str = dt_time.strftime("%H:%M")
+
+    crm_endpoint = f"{FRAPPE_CRM_URL}/api/resource/TechnicianSchedule"
+    
+    # We use a JSON array format for Frappe filters: [["field", "operator", "value"]]
+    # This prevents matching "Cancelled" records if they exist.
+    filters = json.dumps([
+        ["technician", "=", technician_id],
+        ["schedule_date", "=", date_str],
+        ["schedule_time", "=", time_str],
+        ["status", "!=", "Cancelled"]
+    ])
+
+    headers = {
+        "Authorization": f"token {FRAPPE_CRM_API_KEY}:{FRAPPE_CRM_API_SECRET}",
+        "Content-Type": "application/json",
+    }
+
+    logger.info(f"Querying CRM availability for {technician_id} on {date_str} at {time_str} with filters: {filters}")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                crm_endpoint,
+                params={"filters": filters},
+                headers=headers,
+                timeout=10.0,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                records = data.get("data", [])
+                if len(records) > 0:
+                    logger.info(f"Technician {technician_id} is UNAVAILABLE on {date_str} at {time_str} (found {len(records)} existing booking(s)).")
+                    return f"UNAVAILABLE: {technician_id} already has a booking on {date_str} at {time_str}."
+                else:
+                    logger.info(f"Technician {technician_id} is AVAILABLE on {date_str} at {time_str}.")
+                    return f"AVAILABLE: {technician_id} is free on {date_str} at {time_str}."
+            else:
+                logger.error(f"CRM availability check failed: HTTP {response.status_code} - Body: {response.text}")
+                return "ERROR: Could not verify availability with CRM."
+    except Exception as e:
+        logger.error(f"CRM network error during check_availability: {e}")
+        return f"ERROR: Failed to connect to CRM ({e})."
+
+
+# ---------------------------------------------------------------------------
 # MCP Tool: check_and_book_slot
 # ---------------------------------------------------------------------------
 @mcp.tool(
     name="check_and_book_slot",
     description=(
-        "Validates availability, acquires a pessimistic lock, and books a "
-        "technician slot in the Frappe CRM. Returns SUCCESS on booking or "
-        "a structured ERROR string explaining why the booking failed."
+        "SECOND STEP — Call this ONLY AFTER check_availability returns AVAILABLE. "
+        "Validates, acquires a Redis lock, and books a technician slot in the "
+        "Frappe CRM. Returns SUCCESS on booking or an ERROR string explaining why."
     ),
 )
 async def check_and_book_slot(
@@ -188,6 +275,12 @@ async def check_and_book_slot(
       5. On success, leave the lock to expire naturally (5-min propagation buffer)
       6. On CRM failure, release the lock immediately
     """
+    logger.info(
+        f"check_and_book_slot called: technician_id={technician_id}, "
+        f"customer_name={customer_name}, customer_phone={customer_phone}, "
+        f"proposed_date={proposed_date}, proposed_time={proposed_time}, "
+        f"service_type={service_type}"
+    )
 
     # -----------------------------------------------------------------------
     # Step 1: Pydantic Validation
@@ -205,7 +298,7 @@ async def check_and_book_slot(
             issue_description=issue_description,
         )
     except Exception as e:
-        logger.warning(f"Validation failed: {e}")
+        logger.warning(f"Validation failed for booking slot: {e}")
         return f"VALIDATION_ERROR: {e}"
 
     time_str = request.proposed_time.strftime("%H:%M")
@@ -224,6 +317,7 @@ async def check_and_book_slot(
     # SET NX PX 300000:
     #   NX = only set if key doesn't exist (pessimistic lock acquisition)
     #   PX = 300,000 ms (300 second / 5 minute TTL dead-man's switch)
+    logger.info(f"Attempting to acquire Redis lock for key '{lock_key}' with token '{lock_token}'")
     lock_acquired = await redis_client.set(
         lock_key, lock_token, nx=True, px=300000
     )
@@ -231,7 +325,7 @@ async def check_and_book_slot(
     if not lock_acquired:
         # The slot is currently being booked by another dispatcher.
         # Provide actionable feedback so the LLM can pivot the conversation.
-        logger.warning(f"Lock collision detected for {lock_key}")
+        logger.warning(f"Lock collision detected for {lock_key}. Slot is already locked by another dispatcher.")
         next_hour = (request.proposed_time.hour + 1) % 24
         # Clamp suggestion to business hours
         if next_hour < 8:
@@ -249,33 +343,45 @@ async def check_and_book_slot(
             f"Apologize to the caller and offer {next_hour:02d}:00 instead."
         )
 
+    logger.info(f"Redis lock successfully acquired for key '{lock_key}'")
+
     # -----------------------------------------------------------------------
     # Step 3: Proxy to Frappe CRM
     # -----------------------------------------------------------------------
+    crm_endpoint = f"{FRAPPE_CRM_URL}/api/resource/TechnicianSchedule"
+    crm_payload = {
+        "technician": request.technician_id,
+        "customer_name": request.customer_name,
+        "customer_phone": request.customer_phone,
+        "schedule_date": date_str,
+        "schedule_time": time_str,
+        "service_type": request.service_type,
+        "issue_description": request.issue_description,
+        "status": "Pending",
+    }
+    headers = {
+        "Authorization": f"token {FRAPPE_CRM_API_KEY}:{FRAPPE_CRM_API_SECRET}",
+        "Content-Type": "application/json",
+    }
+
+    logger.info(f"CRM REQUEST: POST {crm_endpoint}")
+    logger.info(f"CRM PAYLOAD: {crm_payload}")
+    logger.debug(f"CRM AUTH: token {FRAPPE_CRM_API_KEY[:4]}****:{FRAPPE_CRM_API_SECRET[:4]}****")
+
     try:
         async with httpx.AsyncClient() as client:
-            crm_payload = {
-                "technician": request.technician_id,
-                "customer_name": request.customer_name,
-                "customer_phone": request.customer_phone,
-                "schedule_date": date_str,
-                "schedule_time": time_str,
-                "service_type": request.service_type,
-                "issue_description": request.issue_description,
-                "status": "Confirmed",
-            }
-
-            headers = {
-                "Authorization": f"token {FRAPPE_CRM_API_KEY}:{FRAPPE_CRM_API_SECRET}",
-                "Content-Type": "application/json",
-            }
-
             response = await client.post(
-                f"{FRAPPE_CRM_URL}/api/resource/TechnicianSchedule",
+                crm_endpoint,
                 json=crm_payload,
                 headers=headers,
                 timeout=10.0,
             )
+
+            logger.info(
+                f"CRM RESPONSE: HTTP {response.status_code} "
+                f"({response.reason_phrase})"
+            )
+            logger.info(f"CRM RESPONSE BODY: {response.text[:1000]}")
 
             if response.status_code == 200:
                 logger.info(
@@ -290,21 +396,37 @@ async def check_and_book_slot(
                 )
             elif response.status_code == 409:
                 # Frappe rejects due to a database-level conflict.
-                # Release the Redis lock explicitly.
+                logger.warning(f"CRM returned 409 conflict. Releasing lock for {lock_key}.")
                 await _safe_unlock(lock_key, lock_token)
                 return (
                     "ERROR: CRM_CONFLICT. The CRM reports a scheduling conflict "
                     "for this slot. Ask the user for another time."
                 )
             else:
+                logger.error(
+                    f"CRM rejected booking with status HTTP {response.status_code}. Releasing lock for {lock_key}."
+                )
                 await _safe_unlock(lock_key, lock_token)
-                return "ERROR: hmm.. it seems like I can't access the calendar right now, can I give you a call in a few minutes to check?"
+                logger.error(
+                    f"CRM rejected booking details: HTTP {response.status_code} — "
+                    f"{response.text[:500]}"
+                )
+                return (
+                    f"CRITICAL_ERROR: CRM returned HTTP {response.status_code}. "
+                    "Apologize to the caller and let them know a representative "
+                    "will call them back shortly to confirm."
+                )
 
     except httpx.RequestError as e:
         # Network failure to CRM. Release lock to prevent capacity blocking.
+        logger.error(f"CRM network error during booking. Releasing lock for {lock_key}.")
         await _safe_unlock(lock_key, lock_token)
-        logger.error(f"CRM network error: {e}")
-        return "ERROR: hmm.. it seems like I can't access the calendar right now, can I give you a call in a few minutes to check?"
+        logger.error(f"CRM network error ({type(e).__name__}): {e}")
+        return (
+            f"CRITICAL_ERROR: Failed to connect to CRM ({e}). "
+            "Apologize to the caller and let them know a representative "
+            "will call them back shortly to confirm."
+        )
 
     # Note: Upon a successful HTTP 200 booking, we deliberately DO NOT delete
     # the lock key. Allowing the 5-minute TTL to expire naturally provides a
@@ -335,7 +457,14 @@ async def _safe_unlock(lock_key: str, lock_token: str):
     a lock that has been acquired by another caller after our TTL expired.
     """
     try:
-        await redis_client.eval(UNLOCK_SCRIPT, 1, lock_key, lock_token)
+        logger.info(f"Attempting safe unlock for key '{lock_key}' with token '{lock_token}'")
+        result = await redis_client.eval(UNLOCK_SCRIPT, 1, lock_key, lock_token)
+        if result == 1:
+            logger.info(f"Successfully released lock for key '{lock_key}'")
+        else:
+            logger.warning(
+                f"Failed to release lock for key '{lock_key}'. Token mismatch or lock already expired/released."
+            )
     except Exception as e:
         logger.error(f"Failed to release lock {lock_key}: {e}")
 
